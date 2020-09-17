@@ -36,8 +36,8 @@ Options:
     -r    Region. uses RAILS_C_REGION by default
     -s    Service. uses RAILS_C_SERVICE by default. Ignored if -d (or
           RAILS_C_TASK_DEFINITION) is specified
-    -u    SSH user to use. uses RAILS_C_SSHUSER. defaults to ec2-user if not
-          specified.
+    -u    SSH user to use. uses RAILS_C_SSHUSER by default. If unspecified in
+          both instances, defaults to ec2-user.
 ```
 
 ## Installation
