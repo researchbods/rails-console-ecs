@@ -12,28 +12,46 @@ Usage:
 Options:
     -v    Version
     -h    Show help of this command
-    -c    Ecs cluster which a task runs in. use RAILS_C_ECS_CLUSTER by default
-    -d    Ecs task definition. use RAILS_C_TASK_DEFINITION by default
-    -e    Rails env. use RAILS_C_ENV by default
-    -r    Region. use RAILS_C_REGION by default
+    -c    Ecs cluster which a task runs in. uses RAILS_C_ECS_CLUSTER by default
+    -d    Ecs task definition. uses RAILS_C_TASK_DEFINITION by default, or
+          discovers the task definition from the service specified with -s.
+    -e    Rails env. uses RAILS_C_ENV by default
+    -j    SSH jump host to connect via. uses RAILS_C_JUMPHOST by default.
+          You can specify the user with -j user@server. if unset, jump host will
+          not be used.
+    -p    SSH port to use for connection - defaults to RAILS_C_PORT or 22.
+    -r    Region. uses RAILS_C_REGION by default
+    -s    Service. uses RAILS_C_SERVICE by default. Ignored if -d (or
+          RAILS_C_TASK_DEFINITION) is specified
+    -u    SSH user to use. uses RAILS_C_SSHUSER. defaults to ec2-user if not
+          specified.
 EOF
   exit "$1"
 }
 
-while getopts :c:d:e:r:vh OPT
+while getopts :c:d:e:j:p:r:s:vh OPT
 do
   case $OPT in
-    "c") 
+    "c")
       opt_c=$OPTARG
       ;;
-    "d") 
+    "d")
       opt_d="$OPTARG"
       ;;
-    "e") 
+    "e")
       opt_e="$OPTARG"
       ;;
-    "r") 
+    "j")
+      opt_j="$OPTARG"
+      ;;
+    "p")
+      opt_p="$OPTARG"
+      ;;
+    "r")
       opt_r="$OPTARG"
+      ;;
+    "s")
+      opt_s="$OPTARG"
       ;;
     "v")
       version_flag="TRUE"
@@ -55,35 +73,93 @@ fi
 [ "$help_flag" = "TRUE" ] && usage_exit 0
 [ "$invalid_opt_flag" = "TRUE" ] && usage_exit 1
 [ -z "$opt_c" ] && [ -z "$RAILS_C_ECS_CLUSTER" ] && usage_exit 1
-[ -z "$opt_d" ] && [ -z "$RAILS_C_TASK_DEFINITION" ] && usage_exit 1
 [ -z "$opt_e" ] && [ -z "$RAILS_C_ENV" ] && usage_exit 1
 [ -z "$opt_r" ] && [ -z "$RAILS_C_REGION" ] && usage_exit 1
 
-abort() {
+# only show usage if -d and -s are blank
+[ -z "$opt_d" ] && [ -z "$RAILS_C_TASK_DEFINITION" ] && \
+  [ -z "$opt_s" ] && [ -z "$RAILS_C_SERVICE" ] && usage_exit 1
+
+clean_stop() {
+  if [ -n "$task_arn" ]; then
+    echo "Stopping task"
+    aws ecs stop-task --region "$region" --task "$task_arn" --cluster "$cluster" > /dev/null
+    aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn" --region "$region"
+    echo "Task has stopped"
+  fi
   echo "$@" 1>&2
+}
+
+abort() {
+  clean_stop "$@"
+  exit 1
 }
 
 cluster=${opt_c:-$RAILS_C_ECS_CLUSTER}
 task_definition=${opt_d:-$RAILS_C_TASK_DEFINITION}
+service=${opt_s:-$RAILS_C_TASK_DEFINITION}
 rails_env=${opt_e:-$RAILS_C_ENV}
+jump_host=${opt_j:-$RAILS_C_JUMPHOST}
 region=${opt_r:-$RAILS_C_REGION}
+port=${opt_p:-$RAILS_C_PORT}
+port=${port:-22}
+user=${opt_u:-$RAILS_C_USER}
+user=${user:-ec2-user}
 
-container_instance_arn=$(aws ecs list-container-instances \
-  --region "$region" \
-  --cluster "$cluster" \
-  --query 'containerInstanceArns[0]' \
-  --output text)
+trap abort EXIT
+trap abort SIGINT
+
+ssh="ssh -p '$port'"
+
+if [ -n "$jump_host" ]; then
+  ssh="ssh -J '$jump_host'"
+fi
+
+if [ -z "$task_definition" ]; then
+  echo "discovering task definition for $service..."
+  # auto-discover task_definition using the service
+  task_definition=$(aws ecs describe-services \
+    --region "$region" \
+    --cluster "$cluster" \
+    --service "$service" \
+    --query 'services[0].deployments[?desiredCount > `0`].taskDefinition' \
+    --output text)
+
+  echo "found task definition: $task_definition"
+  if [ -z "$task_definition" ] || [ "$task_definition" = "null" ]; then
+    echo "task definition couldn't be found"
+  fi
+fi
+
+
+echo "Running rails console task"
 
 run_task_result=$(aws ecs run-task \
   --region "$region" \
   --task-definition "$task_definition" \
   --cluster "$cluster")
 
+echo $run_task_result
 run_task_failures=$(echo "$run_task_result" | jq '.failures[]')
 [ -n "$run_task_failures" ] && abort "$run_task_failures"
 
 task_arn=$(echo "$run_task_result" | jq -r '.tasks[0].taskArn')
+echo "rails console task has arn $task_arn"
+
+echo "waiting for task to boot up..."
 aws ecs wait tasks-running --cluster "$cluster" --tasks "$task_arn" --region "$region"
+echo "task is running."
+
+echo "Finding container instance that task is running on..."
+
+container_instance_arn=$(aws ecs describe-tasks \
+  --region "$region" \
+  --cluster "$cluster" \
+  --task "$task_arn" \
+  --query 'tasks[0].containerInstanceArn' \
+  --output text)
+
+echo "Found container instance: $container_instance_arn, looking up ec2 instance."
 
 instance_id=$(aws ecs describe-container-instances --cluster "$cluster" \
   --container-instances "$container_instance_arn" \
@@ -91,17 +167,21 @@ instance_id=$(aws ecs describe-container-instances --cluster "$cluster" \
   --query 'containerInstances[0].ec2InstanceId' \
   --output text)
 
+echo "Found ec2 instance ID: $instance_id, looking up IP"
+
 private_ip=$(aws ec2 describe-instances --instance-id "$instance_id" \
   --region "$region" \
   --query 'Reservations[0].Instances[0].PrivateIpAddress' \
   --output text)
 
-docker_id=$(ssh -t "$private_ip" "curl http://localhost:51678/v1/tasks" | \
+echo "Found IP ($private_ip) - discovering docker container name"
+
+docker_id=$($ssh -t "$user@$private_ip" "curl http://localhost:51678/v1/tasks" | \
   jq -r ".Tasks[] | select(.Arn==\"$task_arn\").Containers[].DockerId")
 
-ssh -t "$private_ip" "docker exec -it \"$docker_id\" bash -c 'cd /app; bin/rails c $rails_env'"
+echo "Opening a console..."
 
-aws ecs stop-task --region "$region" --task "$task_arn" --cluster "$cluster" > /dev/null
-aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn" --region "$region"
+$ssh -t "$user@$private_ip" "docker exec -it \"$docker_id\" bash -c 'cd /app; bin/rails c $rails_env'"
 
+clean_stop "Console closed - exiting"
 exit 0
