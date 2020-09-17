@@ -29,7 +29,7 @@ EOF
   exit "$1"
 }
 
-while getopts :c:d:e:j:p:r:s:vh OPT
+while getopts :c:d:e:j:p:r:s:u:vh OPT
 do
   case $OPT in
     "c")
@@ -52,6 +52,9 @@ do
       ;;
     "s")
       opt_s="$OPTARG"
+      ;;
+    "u")
+      opt_u="$OPTARG"
       ;;
     "v")
       version_flag="TRUE"
