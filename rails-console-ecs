@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -e
+set -eE
 
 VERSION='0.1.0'
 
@@ -81,13 +81,11 @@ fi
   [ -z "$opt_s" ] && [ -z "$RAILS_C_SERVICE" ] && usage_exit 1
 
 clean_stop() {
+  echo "$@" 1>&2
   if [ -n "$task_arn" ]; then
     echo "Stopping task"
     aws ecs stop-task --region "$region" --task "$task_arn" --cluster "$cluster" > /dev/null
-    aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn" --region "$region"
-    echo "Task has stopped"
   fi
-  echo "$@" 1>&2
 }
 
 abort() {
@@ -106,8 +104,9 @@ port=${port:-22}
 user=${opt_u:-$RAILS_C_USER}
 user=${user:-ec2-user}
 
-trap abort EXIT
 trap abort SIGINT
+trap abort ERR
+trap abort TERM
 
 ssh="ssh -p '$port'"
 
@@ -116,7 +115,7 @@ if [ -n "$jump_host" ]; then
 fi
 
 if [ -z "$task_definition" ]; then
-  echo "discovering task definition for $service..."
+  echo -n "discovering task definition for $service..."
   # auto-discover task_definition using the service
   task_definition=$(aws ecs describe-services \
     --region "$region" \
@@ -125,32 +124,31 @@ if [ -z "$task_definition" ]; then
     --query 'services[0].deployments[?desiredCount > `0`].taskDefinition' \
     --output text)
 
-  echo "found task definition: $task_definition"
+  echo "$task_definition"
   if [ -z "$task_definition" ] || [ "$task_definition" = "null" ]; then
-    echo "task definition couldn't be found"
+    abort "task definition couldn't be found"
   fi
 fi
 
 
-echo "Running rails console task"
+echo -n "Running rails console task..."
 
 run_task_result=$(aws ecs run-task \
   --region "$region" \
   --task-definition "$task_definition" \
   --cluster "$cluster")
 
-echo $run_task_result
 run_task_failures=$(echo "$run_task_result" | jq '.failures[]')
-[ -n "$run_task_failures" ] && abort "$run_task_failures"
+[ -n "$run_task_failures" ] && abort "\n$run_task_failures"
 
 task_arn=$(echo "$run_task_result" | jq -r '.tasks[0].taskArn')
-echo "rails console task has arn $task_arn"
+echo "$task_arn"
 
-echo "waiting for task to boot up..."
+echo -n "Waiting for task to finish starting..."
 aws ecs wait tasks-running --cluster "$cluster" --tasks "$task_arn" --region "$region"
-echo "task is running."
+echo "ok!"
 
-echo "Finding container instance that task is running on..."
+echo -n "Finding container instance that task is running on..."
 
 container_instance_arn=$(aws ecs describe-tasks \
   --region "$region" \
@@ -159,7 +157,8 @@ container_instance_arn=$(aws ecs describe-tasks \
   --query 'tasks[0].containerInstanceArn' \
   --output text)
 
-echo "Found container instance: $container_instance_arn, looking up ec2 instance."
+echo "$container_instance_arn"
+echo -n "Looking up EC2 Instance ID..."
 
 instance_id=$(aws ecs describe-container-instances --cluster "$cluster" \
   --container-instances "$container_instance_arn" \
@@ -167,21 +166,24 @@ instance_id=$(aws ecs describe-container-instances --cluster "$cluster" \
   --query 'containerInstances[0].ec2InstanceId' \
   --output text)
 
-echo "Found ec2 instance ID: $instance_id, looking up IP"
+echo "$instance_id"
+echo -n "Looking up IP..."
 
 private_ip=$(aws ec2 describe-instances --instance-id "$instance_id" \
   --region "$region" \
   --query 'Reservations[0].Instances[0].PrivateIpAddress' \
   --output text)
 
-echo "Found IP ($private_ip) - discovering docker container name"
+echo "$private_ip"
+echo -n "Detecting docker container ID..."
 
 docker_id=$($ssh -t "$user@$private_ip" "curl http://localhost:51678/v1/tasks" | \
   jq -r ".Tasks[] | select(.Arn==\"$task_arn\").Containers[].DockerId")
 
-echo "Opening a console..."
+echo "$docker_id"
+echo "Opening console"
 
-$ssh -t "$user@$private_ip" "docker exec -it \"$docker_id\" bash -c 'cd /app; bin/rails c $rails_env'"
+$ssh -t "$user@$private_ip" "docker exec -it \"$docker_id\" bash -c 'bundle exec rails c $rails_env'"
 
 clean_stop "Console closed - exiting"
 exit 0
