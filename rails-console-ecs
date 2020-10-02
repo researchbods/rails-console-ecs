@@ -5,6 +5,10 @@ set -eE
 VERSION='0.1.0'
 
 usage_exit() {
+  if [ -n "$2" ]; then
+    echo "$2"
+    echo
+  fi
   cat <<EOF
 Usage:
     $(basename "${0}") [options]
@@ -74,14 +78,14 @@ if [ "$version_flag" = "TRUE" ]; then
 fi
 
 [ "$help_flag" = "TRUE" ] && usage_exit 0
-[ "$invalid_opt_flag" = "TRUE" ] && usage_exit 1
-[ -z "$opt_c" ] && [ -z "$RAILS_C_ECS_CLUSTER" ] && usage_exit 1
-[ -z "$opt_e" ] && [ -z "$RAILS_C_ENV" ] && usage_exit 1
-[ -z "$opt_r" ] && [ -z "$RAILS_C_REGION" ] && usage_exit 1
+[ "$invalid_opt_flag" = "TRUE" ] && usage_exit 1 "invalid opt flag"
+[ -z "$opt_c" ] && [ -z "$RAILS_C_ECS_CLUSTER" ] && usage_exit 1 "missing cluster"
+[ -z "$opt_e" ] && [ -z "$RAILS_C_ENV" ] && usage_exit 1 "missing env"
+[ -z "$opt_r" ] && [ -z "$RAILS_C_REGION" ] && usage_exit 1 "missing region"
 
 # only show usage if -d and -s are blank
 [ -z "$opt_d" ] && [ -z "$RAILS_C_TASK_DEFINITION" ] && \
-  [ -z "$opt_s" ] && [ -z "$RAILS_C_SERVICE" ] && usage_exit 1
+  [ -z "$opt_s" ] && [ -z "$RAILS_C_SERVICE" ] && usage_exit 1 "missing taskdef / service"
 
 clean_stop() {
   echo "$@" 1>&2
