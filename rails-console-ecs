@@ -3,6 +3,7 @@
 set -eE
 
 VERSION='0.1.0'
+VERBOSE="yes"
 
 usage_exit() {
   if [ -n "$2" ]; then
@@ -11,11 +12,13 @@ usage_exit() {
   fi
   cat <<EOF
 Usage:
-    $(basename "${0}") [options]
+    $(basename "${0}") [options] -- [command]
 
 Options:
     -v    Version
     -h    Show help of this command
+    -b    Buffer stdout from task and wait until after the task has finished
+          exiting to output it.
     -c    Ecs cluster which a task runs in. uses RAILS_C_ECS_CLUSTER by default
     -d    Ecs task definition. uses RAILS_C_TASK_DEFINITION by default, or
           discovers the task definition from the service specified with -s.
@@ -23,19 +26,26 @@ Options:
     -j    SSH jump host to connect via. uses RAILS_C_JUMPHOST by default.
           You can specify the user with -j user@server. if unset, jump host will
           not be used.
+    -m    Memory override to use. Defaults to 512, but can be increased/reduced
+          if needed.
     -p    SSH port to use for connection - defaults to RAILS_C_PORT or 22.
     -r    Region. uses RAILS_C_REGION by default
     -s    Service. uses RAILS_C_SERVICE by default. Ignored if -d (or
           RAILS_C_TASK_DEFINITION) is specified
     -u    SSH user to use. uses RAILS_C_SSHUSER by default. If unspecified in
           both instances, defaults to ec2-user.
+    -x    Command to run instead of rails console. Instead of using -x you can
+          use --
 EOF
   exit "$1"
 }
 
-while getopts :c:d:e:j:p:r:s:u:vh OPT
+while getopts :bc:d:e:hj:m:p:qr:s:u:vx: OPT
 do
   case $OPT in
+    "b")
+      BUFFER_OUTPUT="yes"
+      ;;
     "c")
       opt_c=$OPTARG
       ;;
@@ -48,8 +58,14 @@ do
     "j")
       opt_j="$OPTARG"
       ;;
+    "m")
+      opt_m="$OPTARG"
+      ;;
     "p")
       opt_p="$OPTARG"
+      ;;
+    "q")
+      VERBOSE=""
       ;;
     "r")
       opt_r="$OPTARG"
@@ -63,6 +79,9 @@ do
     "v")
       version_flag="TRUE"
       ;;
+    "x")
+      opt_x="$OPTARG"
+      ;;
     "h")
       help_flag="TRUE"
       ;;
@@ -71,6 +90,8 @@ do
       ;;
   esac
 done
+
+shift $((OPTIND -1))
 
 if [ "$version_flag" = "TRUE" ]; then
   echo $VERSION
@@ -83,6 +104,7 @@ fi
 [ -z "$opt_e" ] && [ -z "$RAILS_C_ENV" ] && usage_exit 1 "missing env"
 [ -z "$opt_r" ] && [ -z "$RAILS_C_REGION" ] && usage_exit 1 "missing region"
 
+
 # only show usage if -d and -s are blank
 [ -z "$opt_d" ] && [ -z "$RAILS_C_TASK_DEFINITION" ] && \
   [ -z "$opt_s" ] && [ -z "$RAILS_C_SERVICE" ] && usage_exit 1 "missing taskdef / service"
@@ -90,7 +112,7 @@ fi
 clean_stop() {
   echo "$@" 1>&2
   if [ -n "$task_arn" ]; then
-    echo "Stopping task"
+    echo "Stopping task" >&2
     aws ecs stop-task --region "$region" --task "$task_arn" --cluster "$cluster" > /dev/null
   fi
 }
@@ -105,11 +127,13 @@ task_definition=${opt_d:-$RAILS_C_TASK_DEFINITION}
 service=${opt_s:-$RAILS_C_TASK_DEFINITION}
 rails_env=${opt_e:-$RAILS_C_ENV}
 jump_host=${opt_j:-$RAILS_C_JUMPHOST}
+memory=${opt_m:-512}
 region=${opt_r:-$RAILS_C_REGION}
 port=${opt_p:-$RAILS_C_PORT}
 port=${port:-22}
 user=${opt_u:-$RAILS_C_USER}
 user=${user:-ec2-user}
+cmd=${opt_x:-${@:-env RAILS_ENV=$rails_env bundle exec rails console}}
 
 trap abort SIGINT
 trap abort ERR
@@ -122,7 +146,7 @@ if [ -n "$jump_host" ]; then
 fi
 
 if [ -z "$task_definition" ]; then
-  echo -n "discovering task definition for $service..."
+  echo -n "discovering task definition for $service..." >&2
   # auto-discover task_definition using the service
   task_definition=$(aws ecs describe-services \
     --region "$region" \
@@ -131,31 +155,41 @@ if [ -z "$task_definition" ]; then
     --query 'services[0].deployments[?desiredCount > `0`].taskDefinition' \
     --output text)
 
-  echo "$task_definition"
+  echo "$task_definition" >&2
   if [ -z "$task_definition" ] || [ "$task_definition" = "null" ]; then
     abort "task definition couldn't be found"
   fi
 fi
 
 
-echo -n "Running rails console task..."
+echo -n "discovering container name..." >&2
+container=$(aws ecs describe-task-definition \
+  --region "$region" \
+  --task-definition "$task_definition" \
+  --query 'taskDefinition.containerDefinitions[].name' \
+  --output text | head -n 1)
+echo "$container" >&2
+
+echo -n "Running rails console task..." >&2
 
 run_task_result=$(aws ecs run-task \
   --region "$region" \
   --task-definition "$task_definition" \
+  --group "telyns-wacky-funtime-parade" \
+  --overrides '{"containerOverrides":[{"name":"'"$container"'", "command": ["bash","-c","sleep 3600"], "environment": [{"name":"rails_console_ecs","value": "true" }] }]}' \
   --cluster "$cluster")
 
 run_task_failures=$(echo "$run_task_result" | jq '.failures[]')
 [ -n "$run_task_failures" ] && abort "\n$run_task_failures"
 
 task_arn=$(echo "$run_task_result" | jq -r '.tasks[0].taskArn')
-echo "$task_arn"
+echo "$task_arn" >&2
 
-echo -n "Waiting for task to finish starting..."
+echo -n "Waiting for task to finish starting..." >&2
 aws ecs wait tasks-running --cluster "$cluster" --tasks "$task_arn" --region "$region"
-echo "ok!"
+echo "ok!" >&2
 
-echo -n "Finding container instance that task is running on..."
+echo -n "Finding container instance that task is running on..." >&2
 
 container_instance_arn=$(aws ecs describe-tasks \
   --region "$region" \
@@ -164,8 +198,8 @@ container_instance_arn=$(aws ecs describe-tasks \
   --query 'tasks[0].containerInstanceArn' \
   --output text)
 
-echo "$container_instance_arn"
-echo -n "Looking up EC2 Instance ID..."
+echo "$container_instance_arn" >&2
+echo -n "Looking up EC2 Instance ID..." >&2
 
 instance_id=$(aws ecs describe-container-instances --cluster "$cluster" \
   --container-instances "$container_instance_arn" \
@@ -173,24 +207,29 @@ instance_id=$(aws ecs describe-container-instances --cluster "$cluster" \
   --query 'containerInstances[0].ec2InstanceId' \
   --output text)
 
-echo "$instance_id"
-echo -n "Looking up IP..."
+echo "$instance_id" >&2
+echo -n "Looking up IP..." >&2
 
 private_ip=$(aws ec2 describe-instances --instance-id "$instance_id" \
   --region "$region" \
   --query 'Reservations[0].Instances[0].PrivateIpAddress' \
   --output text)
 
-echo "$private_ip"
-echo -n "Detecting docker container ID..."
+echo "$private_ip" >&2
+echo -n "Detecting docker container ID..." >&2
 
 docker_id=$($ssh -t "$user@$private_ip" "curl http://localhost:51678/v1/tasks" | \
   jq -r ".Tasks[] | select(.Arn==\"$task_arn\").Containers[].DockerId")
 
-echo "$docker_id"
-echo "Opening console"
+echo "$docker_id" >&2
+echo "Opening console" >&2
 
-$ssh -t "$user@$private_ip" "docker exec -it \"$docker_id\" bash -c 'bundle exec rails c $rails_env'"
+if [ "$BUFFER_OUTPUT" = "yes" ]; then
+    OUTPUT_BUFFER=$($ssh -t "$user@$private_ip" -- docker exec -it "$docker_id" ${cmd//"\'"/\'\\\'\'} 2>&1)
+else
+    $ssh -t "$user@$private_ip" -- docker exec -it "$docker_id" ${cmd//"\'"/\'\\\'\'}
+fi
 
 clean_stop "Console closed - exiting"
+[ "$BUFFER_OUTPUT" = "yes" ] && echo $OUTPUT_BUFFER
 exit 0
